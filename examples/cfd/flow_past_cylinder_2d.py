@@ -55,8 +55,8 @@ compute_backend = ComputeBackend.WARP
 precision_policy = PrecisionPolicy.FP32FP32
 velocity_set = xlb.velocity_set.D2Q9(precision_policy=precision_policy, compute_backend=compute_backend)  # D2Q9 for 2D
 
-num_steps = 300_000
-post_process_interval = 50_000
+num_steps = 1_000
+post_process_interval = 100
 
 # Initialize XLB
 xlb.init(
@@ -81,7 +81,9 @@ cylinder_radius = D // 2
 x = np.arange(grid_shape[0])
 y = np.arange(grid_shape[1])
 X, Y = np.meshgrid(x, y, indexing="ij")
-indices = np.where((X - 2 * D) ** 2 + (Y - 2 * D) ** 2 < cylinder_radius**2)
+cylinder_center_x = 2 * D
+cylinder_center_y = 2 * D
+indices = np.where((X - cylinder_center_x) ** 2 + (Y - cylinder_center_y) ** 2 < cylinder_radius**2)
 cylinder = [tuple(indices[i]) for i in range(velocity_set.d)]
 
 cylinder_mask = np.zeros(grid_shape, dtype=np.uint8)
@@ -102,12 +104,40 @@ boundary_mask = (cylinder_mask == 0) & (neighbor_count > 0)
 # Get boundary indices
 boundary_indices = np.argwhere(boundary_mask)  # shape (N, 2)
 
-H_y = float(grid_shape[1] - 1)
-y_center = y - (H_y / 2.0)
-r_squared = (2.0 * y_center / H_y) ** 2.0
+def get_jet_velocities(control, jet_angle: float = 20.0):
+    def get_velocity_profile(alpha):
+        if jnp.abs(alpha) > jet_angle / 2:
+            return 0, 0.
+        
+        u_magnitude = 6. * (jet_angle / 2.0 - alpha) * (jet_angle / 2.0 + alpha) / (jet_angle ** 2.)
 
-u = 6. * (y_center - U) * (y_center + U) / (H_y ** 2.) * U
+        u_x = u_magnitude * jnp.cos(np.radians(alpha))
+        u_y = u_magnitude * jnp.sin(np.radians(alpha))
 
+        return u_x, u_y
+    
+    jet_velocities = jnp.zeros((*cylinder_mask.shape, 2,), dtype=jnp.float32)
+
+    for x in range(grid_shape[0]):
+        for y in range(grid_shape[1]):
+            if boundary_mask[x, y]:
+                angle = jnp.degrees(jnp.arctan2(jnp.abs(x - cylinder_center_x), jnp.abs(y - cylinder_center_y)))
+                u_x, u_y = get_velocity_profile(angle)
+
+                if x >= cylinder_center_x or y >= cylinder_center_y:
+                    u_x = -u_x
+
+                jet_velocities = jet_velocities.at[x, y, 0].set(u_x)
+                jet_velocities = jet_velocities.at[x, y, 1].set(u_y)
+
+    jet_velocities *= control
+
+    min_v, max_v = jnp.min(jet_velocities), jnp.max(jet_velocities)
+    print(f"Jet velocities range: min={min_v:.4f}, max={max_v:.4f}")
+
+    jet_velocities = wp.array(jet_velocities)
+
+    return jet_velocities
 
 # Define Boundary Conditions
 def bc_profile():
@@ -183,6 +213,25 @@ def calculate_vorticity(u):
     return vorticity
 
 import matplotlib.pyplot as plt
+
+def plot_qiver(u, v, t):
+    plt.figure(figsize=(8, 6))
+    speed = np.sqrt(u**2 + v**2)
+
+    stride = 10
+    _x = np.arange(0, u.shape[1], stride)
+    _y = np.arange(0, u.shape[0], stride)
+    _X, _Y = np.meshgrid(_x, _y)
+
+    u_sub = u[::stride, ::stride]
+    v_sub = v[::stride, ::stride]
+
+    im = plt.imshow(speed, cmap="viridis", origin="lower")
+    plt.quiver(_X, _Y, u_sub, v_sub, color="white", scale=10)
+    plt.title("Velocity Field (Magnitude + Direction)")
+    
+    plt.savefig(f"velocity_field_{t}.png", bbox_inches='tight', dpi=300)
+
 def plot(vorticity, t, name="vorticity"):
     # Plot the vorticity field
     plt.figure(figsize=(8, 6))
@@ -249,7 +298,7 @@ def compute_cd_cl(force):
     cd = 2 * force[0] / (1.0 * U**2 * D)
     cl = 2 * force[1] / (1.0 * U**2 * D)
 
-    return cd, cl
+    return -cd, -cl
 
 # Post-Processing Function
 def post_process(step, f_current):
@@ -275,6 +324,8 @@ def post_process(step, f_current):
 
     plot(u_magnitude[:, :, 0].T, step, name="u_magnitude")
     plot(vorticity.T, step, name="vorticity")
+
+    plot_qiver(u[0, :, :, 0].T, u[1, :, :, 0].T, step)
 
     force = compute_force(f_current, cylinder_mask, velocity_set)
 
@@ -306,9 +357,12 @@ def post_process(step, f_current):
 
 # -------------------------- Simulation Loop --------------------------
 
+strength = 5
+control = get_jet_velocities(strength * U, jet_angle=20.0) 
+
 start_time = time.time()
 for step in range(num_steps):
-    f_0, f_1 = stepper(f_0, f_1, bc_mask, missing_mask, OMEGA, step)
+    f_0, f_1 = stepper(f_0, f_1, bc_mask, missing_mask, OMEGA, step, control)
     f_0, f_1 = f_1, f_0  # Swap the buffers
 
     if step % post_process_interval == 0 or step == num_steps - 1:
@@ -319,3 +373,40 @@ for step in range(num_steps):
         elapsed = end_time - start_time
         print(f"Completed step {step}. Time elapsed for {post_process_interval} steps: {elapsed:.6f} seconds.")
         start_time = time.time()
+
+
+import gymnasium as gym
+
+
+class FlowPastCylinderEnv(gym.Env):
+    def __init__(self, num_steps=1000, post_process_interval=100):
+        super().__init__()
+        self.num_steps = num_steps
+        self.post_process_interval = post_process_interval
+        self.current_step = 0
+        self.f_0 = f_0
+        self.f_1 = f_1
+        self.control = strength * U
+        self.last_action = 0
+        self.delta_t = 50
+
+    def step(self, action):
+        # Update control based on action
+        self.control = get_jet_velocities(action * U, jet_angle=20.0)
+
+        # Run the stepper
+        for _ in range(self.delta_t):
+            self.f_0, self.f_1 = stepper(self.f_0, self.f_1, bc_mask, missing_mask, OMEGA, self.current_step, self.control)
+            self.f_0, self.f_1 = self.f_1, self.f_0
+        
+        self.current_step += 1
+
+        drag, lift = compute_cd_cl(compute_force(self.f_0, cylinder_mask, velocity_set))
+        reward = -drag - 0.2 * lift
+
+        
+
+    def reset(self):
+        # Reset environment state
+        self.current_step = 0
+        return None  # Return initial observation if needed

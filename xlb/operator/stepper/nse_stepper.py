@@ -281,6 +281,7 @@ class IncompressibleNavierStokesStepper(Stepper):
             missing_mask: wp.array4d(dtype=Any),
             omega: Any,
             timestep: int,
+            jet_velocities: wp.array3d(dtype=wp.float32),
         ):
             i, j, k = wp.tid()
             index = wp.vec3i(i, j, k)
@@ -297,6 +298,17 @@ class IncompressibleNavierStokesStepper(Stepper):
 
             # Apply post-streaming boundary conditions
             _f_post_stream = apply_bc(index, timestep, _boundary_id, _missing_mask, f_0, f_1, _f_post_collision, _f_post_stream, True)
+
+            # Apply actuation
+            u_x = jet_velocities[index[0], index[1], 0]
+            u_y = jet_velocities[index[0], index[1], 1]
+
+            # Check if a jet is active
+            if u_x != 0.0 or u_y != 0.0:
+                u_jet = wp.vec2(u_x, u_y)
+                rho_jet = 1.0  # assumed constant
+                _feq_jet = self.equilibrium.warp_functional(rho_jet, u_jet)
+                _f_post_stream = _feq_jet
 
             _rho, _u = self.macroscopic.warp_functional(_f_post_stream)
             _feq = self.equilibrium.warp_functional(_rho, _u)
@@ -315,10 +327,12 @@ class IncompressibleNavierStokesStepper(Stepper):
         return None, kernel
 
     @Operator.register_backend(ComputeBackend.WARP)
-    def warp_implementation(self, f_0, f_1, bc_mask, missing_mask, omega, timestep):
+    def warp_implementation(self, f_0, f_1, bc_mask, missing_mask, omega, timestep, jet_velocities):
         wp.launch(
             self.warp_kernel,
-            inputs=[f_0, f_1, bc_mask, missing_mask, omega, timestep],
+            inputs=[
+                    f_0, f_1, bc_mask, missing_mask, omega, timestep, jet_velocities
+                ],
             dim=f_0.shape[1:],
         )
         return f_0, f_1
